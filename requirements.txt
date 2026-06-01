@@ -5,3 +5,5 @@ numpy
 torch
 torchvision
 Pillow
+joblib
+scikit-learn
