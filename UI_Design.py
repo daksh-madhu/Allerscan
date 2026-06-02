@@ -276,6 +276,11 @@ def scan():
                     # Prepares the uploaded image so the text reader can understand it
                     file_bytes = np.asarray(bytearray(upload_file.read()), dtype=np.uint8)
                     image = cv2.imdecode(file_bytes, 1)
+                    # Shrink massive images to prevent out-of-memory crashes
+                    max_width = 1000
+                    if image.shape[1] > max_width:
+                        ratio = max_width / image.shape[1]
+                        image = cv2.resize(image, (max_width, int(image.shape[0] * ratio)))
 
                     # Scans the image for words, filters out the junk, and then make a list of the food items
                     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -349,6 +354,11 @@ def scan():
                     # Prepares the camera photo so the text reader can understand it
                     file_bytes = np.asarray(bytearray(camera.read()), dtype=np.uint8)
                     image = cv2.imdecode(file_bytes, 1)
+                    # Shrink massive images to prevent out-of-memory crashes
+                    max_width = 1000
+                    if image.shape[1] > max_width:
+                        ratio = max_width / image.shape[1]
+                        image = cv2.resize(image, (max_width, int(image.shape[0] * ratio)))
 
                     # Scans the image for words, filters out the junk, and then make a list of the food items
                     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
