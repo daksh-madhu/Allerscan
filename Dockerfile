@@ -15,7 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import easyocr; reader = easyocr.Reader(['en'])"
 
 
+
 COPY . .
+
+RUN python train_allergen_model.py
 
 
 EXPOSE 8080
