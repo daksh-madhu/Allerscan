@@ -4,6 +4,49 @@ import easyocr
 import re
 import numpy as np
 from predict_allergens import predict_allergens
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
+
+
+# This ensures the model only loads once, preventing the app from lagging
+@st.cache_resource
+def load_food_classifier():
+    # 1. Load the checkpoint FIRST to find out how many classes there are
+    checkpoint = torch.load("food_model.pth", map_location=torch.device('cpu'), weights_only=False)
+    food_classes = checkpoint['classes']
+    num_classes = len(food_classes) # This will dynamically grab the 11 classes
+    
+    # 2. Build the ResNet18 architecture
+    model = models.resnet18()
+    model.fc = nn.Sequential(
+        nn.Linear(model.fc.in_features, 128),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(128, num_classes) # Uses the dynamic count instead of a hardcoded 4
+    )
+    
+    # 3. Load the saved weights into the correctly sized model
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval() 
+    
+    return model, food_classes
+    # Loads the file using a relative path since they are in the same folder
+    checkpoint = torch.load("food_model.pth", map_location=torch.device('cpu'), weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval() 
+    
+    return model, checkpoint['classes']
+
+model, food_classes = load_food_classifier()
+
+# The image transformations your model expects
+image_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
 st.set_page_config(page_icon="🍔", page_title="AllerScan", layout="centered")
 
@@ -349,61 +392,87 @@ def scan():
             st.success("Photo captured")
             
             if st.button("Analyzing for Allergens", type="primary", use_container_width=True, key="btn_camera"):
-                with st.spinner("Reading menu and running ML model..."):
+                with st.spinner("Reading image and running ML models..."):
                     
-                    # Prepares the camera photo so the text reader can understand it
+                    # 1. Prepare the camera photo for OpenCV
                     file_bytes = np.asarray(bytearray(camera.read()), dtype=np.uint8)
                     image = cv2.imdecode(file_bytes, 1)
-                    # Shrink massive images to prevent out-of-memory crashes
+                    
                     max_width = 1000
                     if image.shape[1] > max_width:
                         ratio = max_width / image.shape[1]
                         image = cv2.resize(image, (max_width, int(image.shape[0] * ratio)))
+                    
+                    # 2. Convert to PIL Image for PyTorch
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(image_rgb)
+                    
+                    # 3. Apply your PyTorch transforms
+                    input_tensor = image_transforms(pil_img).unsqueeze(0)
+                    
+                    # 4. Run the ResNet18 Classifier
+                    with torch.no_grad():
+                        outputs = model(input_tensor)
+                        probs = torch.nn.functional.softmax(outputs[0], dim=0)
+                        confidence, class_idx = torch.max(probs, dim=0)
+                        
+                        raw_food_name = food_classes[class_idx.item()].lower().strip()
+                    
+                    # 4.5. The Ingredient Expansion Dictionary!
+                    # Add your other trained food classes and their typical ingredients here
+                    food_ingredient_database = {
+                        "hamburger": "hamburger bun, beef patty, cheddar cheese, mayonnaise",
+                        "pizza": "pizza dough, mozzarella cheese, tomato sauce, pepperoni",
+                        "salad": "lettuce, croutons, parmesan cheese, dressing",
+                        "sushi": "rice, raw fish, seaweed, soy sauce"
+                    }
+                    
+                    # Combine the name and the ingredients to trick the OCR model into finding matches
+                    if raw_food_name in food_ingredient_database:
+                        expanded_text = f"{raw_food_name} {food_ingredient_database[raw_food_name]}"
+                    else:
+                        expanded_text = raw_food_name
 
-                    # Scans the image for words, filters out the junk, and then make a list of the food items
-                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                    reader = easyocr.Reader(["en"])
-                    results = reader.readtext(blurred)
+                    # 5. Pass the expanded text (Name + Ingredients) to your predictor
+                    ml_results = predict_allergens([expanded_text])
 
-                    foodItems = []
-                    for _, text, conf in results:
-                        if conf > 0.5:
-                            cleaned = clean_text(text)
-                            if len(cleaned) > 2 and cleaned.upper() not in JUNK_WORDS:
-                                foodItems.append(cleaned)
-
-                    # Sends the food list to the ML model to guess what ingredients and allergens are present
-                    ml_results = predict_allergens(foodItems)
-
-                    # Displays the results
+                    # --- UI DISPLAY LOGIC ---
                     st.write("---")
                     st.subheader("Analysis Results")
                     
-                    # Takes the active list so we can check the allergens that are toggled "on"
-                    user_allergens = [a.lower() for a in st.session_state.allergen_list]
+                    active_allergens = [a.lower() for a in st.session_state.active_allergens]
 
                     if not ml_results:
                         st.info("No food items detected.")
                     
                     for r in ml_results:
-                        food_name = r["food_item"]
+                        # We use raw_food_name for the UI so the screen doesn't show the massive string
+                        display_name = raw_food_name.title() 
+                        
                         detected_allergens = r["predicted_allergens"]
                         
-                        is_dangerous = any(allergen.lower() in user_allergens for allergen in detected_allergens)
+                        detected_allergens_lower = [a.lower() for a in detected_allergens]
+                        matched_ingredients_lower = [i.lower() for i in r['matched_ingredients']]
 
-                        # Shows a warning if the food is dangerous, or puts it in a green box if it's safe 
+                        is_dangerous = False
+                        
+                        for active in active_allergens:
+                            if (active in detected_allergens_lower) or \
+                               (active in matched_ingredients_lower) or \
+                               (active in display_name.lower()):
+                                is_dangerous = True
+                                break 
+
                         if is_dangerous:
-                            st.error(f"🚨 **WARNING: {food_name}**")
+                            st.error(f"🚨 **WARNING: {display_name}**")
                             st.write(f"**Contains:** {', '.join(detected_allergens)}")
                             st.write(f"**Matched Ingredients:** {', '.join(r['matched_ingredients'])}")
-                            st.caption(f"Confidence: {r['confidence']:.1%}")
+                            st.caption(f"Model Confidence: {confidence.item():.1%}")
                         else:
-                            with st.expander(f"✅ {food_name} (Safe)"):
+                            with st.expander(f"✅ {display_name} (Safe)"):
                                 st.write(f"**Contains:** {', '.join(detected_allergens) if detected_allergens else 'None detected'}")
                                 st.write(f"**Matched Ingredients:** {', '.join(r['matched_ingredients']) if r['matched_ingredients'] else 'N/A'}")
-                                st.caption(f"Confidence: {r['confidence']:.1%}")
-
+                                st.caption(f"Model Confidence: {confidence.item():.1%}")
 
 home = st.Page(homepage, title="HomePage",  default = True)
 prof = st.Page(profile, title = "Profile")
